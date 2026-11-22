@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>NEON DODGER — one prompt, one game</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #050510; overflow: hidden; }
+  body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; background: #050510; touch-action: none;
+           box-shadow: 0 0 60px rgba(0, 229, 255, .25), 0 0 120px rgba(255, 0, 153, .12); }
+  #hint { position: fixed; left: 0; right: 0; bottom: 10px; text-align: center;
+          color: rgba(255,255,255,.45); font-size: 12px; letter-spacing: .12em;
+          pointer-events: none; text-transform: uppercase; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="540" height="960"></canvas></div>
+<div id="hint">Arrows / WASD / mouse / touch &nbsp;·&nbsp; P pause &nbsp;·&nbsp; R restart</div>
+<script>
+"use strict";
+/* NEON DODGER — built by an AI agent from ONE prompt:
+   "Build me a tiny browser game in ONE HTML file, no libraries: NEON DODGER.
+    I steer a glowing ship with arrow keys or mouse/touch, dodge falling
+    asteroids, collect stars for points, 3 lives, speed ramps up,
+    game-over screen with score and press R to restart. Neon style,
+    dark space background with a starfield."
+   No libraries, no network, no assets — everything below is drawn in code. */
+
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height;
+
+// ---------- helpers ----------
+const TAU = Math.PI * 2;
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
+
+// ---------- state ----------
+const AUTOPLAY = new URLSearchParams(location.search).has("autoplay");
+let state = "title";           // title | playing | over
+let score = 0, lives = 3, elapsed = 0, level = 1;
+let best = 0;
+try { best = +localStorage.getItem("neon-dodger-best") || 0; } catch (e) { best = 0; }
+let spawnT = 0, starT = 0, shake = 0, flash = 0;
+let asteroids = [], stars = [], parts = [], bgStars = [];
+
+// ---------- the ship ----------
+const ship = { x: W / 2, y: H - 140, r: 16, vx: 0, vy: 0, tilt: 0, invuln: 0 };
+
+// ---------- input ----------
+const keys = {};
+let pointer = null;            // {x, y} in canvas coords, while held
+addEventListener("keydown", e => {
+  keys[e.key.toLowerCase()] = true;
+  if (["arrowup","arrowdown","arrowleft","arrowright"," "].includes(e.key.toLowerCase())) e.preventDefault();
+  if (state === "title") startGame();
+  else if (state === "over" && (e.key.toLowerCase() === "r" || e.key === "Enter")) startGame();
+  if (e.key.toLowerCase() === "p" && state === "playing") state = "paused";
+  else if (e.key.toLowerCase() === "p" && state === "paused") state = "playing";
+});
+addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+function toCanvas(e) {
+  const r = cv.getBoundingClientRect();
+  const t = e.touches ? e.touches[0] : e;
+  return { x: (t.clientX - r.left) * (W / r.width), y: (t.clientY - r.top) * (H / r.height) };
+}
+cv.addEventListener("pointerdown", e => {
+  pointer = toCanvas(e);
+  if (state === "title" || state === "over") startGame();
+});
+addEventListener("pointermove", e => { if (pointer) pointer = toCanvas(e); });
+addEventListener("pointerup", () => { pointer = null; });
+
+// ---------- starfield ----------
+for (let i = 0; i < 110; i++) {
+  bgStars.push({ x: rand(0, W), y: rand(0, H), s: rand(0.6, 2.2), v: rand(12, 60), tw: rand(0, TAU) });
+}
+
+// ---------- spawning ----------
+function spawnAsteroid() {
+  const r = rand(16, 42);
+  const verts = [];
+  const n = 7 + (Math.random() * 4 | 0);
+  for (let i = 0; i < n; i++) verts.push(rand(0.7, 1.15));
+  asteroids.push({
+    x: rand(r, W - r), y: -r - 10, r,
+    vy: rand(90, 150) + level * 22, vx: rand(-40, 40),
+    rot: rand(0, TAU), vr: rand(-1.6, 1.6), verts, hue: Math.random() < 0.5 ? "#ff2d78" : "#ff9f1c"
+  });
+}
+function spawnStar() {
+  stars.push({ x: rand(24, W - 24), y: -20, r: 11, vy: 110 + level * 14, ph: rand(0, TAU) });
+}
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, TAU), s = rand(speed * 0.3, speed);
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(0.35, 0.8), max: 0.8, color, r: rand(1.5, 3.5) });
+  }
+}
+
+// ---------- game flow ----------
+function startGame() {
+  state = "playing";
+  score = 0; lives = 3; elapsed = 0; level = 1;
+  asteroids = []; stars = []; parts = [];
+  spawnT = 0; starT = 0; shake = 0; flash = 0;
+  ship.x = W / 2; ship.y = H - 140; ship.vx = 0; ship.vy = 0; ship.invuln = 2;
+}
+function gameOver() {
+  state = "over";
+  shake = 14; flash = 1;
+  burst(ship.x, ship.y, "#00e5ff", 60, 320);
+  burst(ship.x, ship.y, "#ff2d78", 40, 240);
+  if (score > best) {
+    best = score;
+    try { localStorage.setItem("neon-dodger-best", String(best)); } catch (e) {}
+  }
+}
+function loseLife(a) {
+  lives--;
+  ship.invuln = 2.2;
+  shake = 10; flash = 0.7;
+  burst(ship.x, ship.y, "#ff2d78", 36, 260);
+  asteroids.splice(asteroids.indexOf(a), 1);
+  if (lives <= 0) gameOver();
+}
+
+// ---------- autopilot (demo mode: ?autoplay=1) ----------
+function autopilot(dt) {
+  // nearest threat below the ship -> dodge; nearest star -> chase
+  let threat = null, td = 1e9;
+  for (const a of asteroids) {
+    if (a.y < ship.y && a.y > ship.y - 420) {
+      const d = Math.abs(a.x - ship.x);
+      if (d < td) { td = d; threat = a; }
+    }
+  }
+  let star = null, sd = 1e9;
+  for (const s of stars) {
+    const d = Math.abs(s.x - ship.x) + Math.abs(s.y - ship.y) * 0.4;
+    if (d < sd) { sd = d; star = s; }
+  }
+  let tx = ship.x;
+  if (threat && td < 90) tx = ship.x + (ship.x < threat.x ? -140 : 140);
+  else if (star) tx = star.x;
+  tx = clamp(tx, 30, W - 30);
+  ship.vx += clamp(tx - ship.x, -1, 1) * 2600 * dt;
+  ship.vy += clamp((H - 150) - ship.y, -1, 1) * 1200 * dt;
+}
+
+// ---------- update ----------
+function update(dt) {
+  elapsed += dt;
+  level = 1 + Math.floor(elapsed / 10);
+  for (const s of bgStars) { s.y += s.v * dt; s.tw += dt * 3; if (s.y > H) { s.y = -4; s.x = rand(0, W); } }
+
+  // steering
+  const ACC = 2600, MAXV = 460;
+  if (AUTOPLAY) autopilot(dt);
+  else {
+    if (keys["arrowleft"] || keys["a"]) ship.vx -= ACC * dt;
+    if (keys["arrowright"] || keys["d"]) ship.vx += ACC * dt;
+    if (keys["arrowup"] || keys["w"]) ship.vy -= ACC * dt;
+    if (keys["arrowdown"] || keys["s"]) ship.vy += ACC * dt;
+    if (pointer) {
+      ship.vx += clamp(pointer.x - ship.x, -1, 1) * 2400 * dt;
+      ship.vy += clamp(pointer.y - ship.y, -1, 1) * 2400 * dt;
+    }
+  }
+  ship.vx *= Math.pow(0.12, dt); ship.vy *= Math.pow(0.12, dt);
+  ship.vx = clamp(ship.vx, -MAXV, MAXV); ship.vy = clamp(ship.vy, -MAXV, MAXV);
+  ship.x = clamp(ship.x + ship.vx * dt, 24, W - 24);
+  ship.y = clamp(ship.y + ship.vy * dt, 90, H - 30);
+  ship.tilt = clamp(ship.vx / MAXV, -1, 1) * 0.35;
+  if (ship.invuln > 0) ship.invuln -= dt;
+  if (Math.abs(ship.vx) > 60 && Math.random() < 0.6)
+    parts.push({ x: ship.x + rand(-4, 4), y: ship.y + 16, vx: rand(-20, 20), vy: rand(120, 200), life: 0.4, max: 0.4, color: "#00e5ff", r: 2 });
+
+  // spawns — density grows with level
+  spawnT -= dt;
+  if (spawnT <= 0) { spawnAsteroid(); spawnT = Math.max(0.22, 0.75 - level * 0.06) * rand(0.7, 1.2); }
+  starT -= dt;
+  if (starT <= 0) { spawnStar(); starT = rand(0.9, 1.8); }
+
+  // asteroids
+  for (let i = asteroids.length - 1; i >= 0; i--) {
+    const a = asteroids[i];
+    a.y += a.vy * dt; a.x += a.vx * dt; a.rot += a.vr * dt;
+    if (a.x < a.r) { a.x = a.r; a.vx = Math.abs(a.vx); }
+    if (a.x > W - a.r) { a.x = W - a.r; a.vx = -Math.abs(a.vx); }
+    if (a.y > H + 60) { asteroids.splice(i, 1); continue; }
+    if (ship.invuln <= 0 && dist2(a.x, a.y, ship.x, ship.y) < (a.r + ship.r - 6) * (a.r + ship.r - 6)) loseLife(a);
+  }
+  // stars
+  for (let i = stars.length - 1; i >= 0; i--) {
+    const s = stars[i];
+    s.y += s.vy * dt; s.ph += dt * 5;
+    if (s.y > H + 30) { stars.splice(i, 1); continue; }
+    if (dist2(s.x, s.y, ship.x, ship.y) < (s.r + ship.r) * (s.r + ship.r)) {
+      score += 10;
+      burst(s.x, s.y, "#ffe94d", 14, 160);
+      stars.splice(i, 1);
+    }
+  }
+  // particles
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.98; p.vy *= 0.98; p.life -= dt;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt * 30);
+  if (flash > 0) flash = Math.max(0, flash - dt * 2.2);
+  score += dt * 1; // survival trickle
+}
+
+// ---------- drawing ----------
+function drawShip() {
+  ctx.save();
+  ctx.translate(ship.x, ship.y);
+  ctx.rotate(ship.tilt);
+  if (ship.invuln > 0 && Math.floor(performance.now() / 120) % 2 === 0) ctx.globalAlpha = 0.35;
+  ctx.shadowColor = "#00e5ff"; ctx.shadowBlur = 22;
+  ctx.fillStyle = "#00e5ff";
+  ctx.beginPath();
+  ctx.moveTo(0, -20); ctx.lineTo(13, 14); ctx.lineTo(0, 7); ctx.lineTo(-13, 14);
+  ctx.closePath(); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#e8feff";
+  ctx.beginPath(); ctx.moveTo(0, -12); ctx.lineTo(6, 8); ctx.lineTo(-6, 8); ctx.closePath(); ctx.fill();
+  // engine flame
+  const f = 10 + Math.random() * 8;
+  ctx.fillStyle = "rgba(255,159,28,.9)";
+  ctx.beginPath(); ctx.moveTo(-5, 14); ctx.lineTo(0, 14 + f); ctx.lineTo(5, 14); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function drawAsteroid(a) {
+  ctx.save();
+  ctx.translate(a.x, a.y); ctx.rotate(a.rot);
+  ctx.shadowColor = a.hue; ctx.shadowBlur = 14;
+  ctx.strokeStyle = a.hue; ctx.lineWidth = 2.5;
+  ctx.fillStyle = "rgba(20,8,24,.85)";
+  ctx.beginPath();
+  const n = a.verts.length;
+  for (let i = 0; i <= n; i++) {
+    const ang = (i % n) / n * TAU, r = a.r * a.verts[i % n];
+    if (i === 0) ctx.moveTo(Math.cos(ang) * r, Math.sin(ang) * r);
+    else ctx.lineTo(Math.cos(ang) * r, Math.sin(ang) * r);
+  }
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = a.hue;
+  ctx.beginPath(); ctx.arc(-a.r * 0.25, -a.r * 0.2, a.r * 0.12, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(a.r * 0.3, a.r * 0.3, a.r * 0.09, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+function drawStar(s) {
+  const p = 1 + Math.sin(s.ph) * 0.25;
+  ctx.save();
+  ctx.translate(s.x, s.y); ctx.scale(p, p);
+  ctx.shadowColor = "#ffe94d"; ctx.shadowBlur = 16;
+  ctx.fillStyle = "#ffe94d";
+  ctx.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const ang = i / 8 * TAU - Math.PI / 2, r = i % 2 === 0 ? 11 : 4.5;
+    if (i === 0) ctx.moveTo(Math.cos(ang) * r, Math.sin(ang) * r);
+    else ctx.lineTo(Math.cos(ang) * r, Math.sin(ang) * r);
+  }
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function drawHUD() {
+  ctx.textBaseline = "top";
+  ctx.shadowColor = "#00e5ff"; ctx.shadowBlur = 12;
+  ctx.fillStyle = "#fff";
+  ctx.font = "700 30px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText("SCORE " + Math.floor(score), 18, 16);
+  ctx.font = "600 16px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillStyle = "rgba(255,255,255,.75)";
+  ctx.fillText("BEST " + best, 18, 54);
+  ctx.fillText("LVL " + level, W - 90, 16);
+  // lives
+  for (let i = 0; i < 3; i++) {
+    ctx.save();
+    ctx.translate(W - 30 - i * 34, 66);
+    ctx.shadowColor = i < lives ? "#ff2d78" : "transparent"; ctx.shadowBlur = i < lives ? 10 : 0;
+    ctx.fillStyle = i < lives ? "#ff2d78" : "rgba(255,255,255,.18)";
+    ctx.beginPath(); ctx.moveTo(0, -9); ctx.lineTo(6, 6); ctx.lineTo(0, 3); ctx.lineTo(-6, 6); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  ctx.shadowBlur = 0;
+}
+function drawCenter(lines, accent) {
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  lines.forEach((ln, i) => {
+    ctx.shadowColor = ln.color || accent; ctx.shadowBlur = 18;
+    ctx.fillStyle = ln.color || "#fff";
+    ctx.font = ln.font;
+    ctx.fillText(ln.text, W / 2, ln.y);
+  });
+  ctx.shadowBlur = 0; ctx.textAlign = "left";
+}
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate(rand(-shake, shake), rand(-shake, shake));
+  // background
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#070718"); g.addColorStop(0.6, "#0a061f"); g.addColorStop(1, "#12041f");
+  ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H + 40);
+  // starfield
+  for (const s of bgStars) {
+    ctx.globalAlpha = 0.35 + 0.65 * Math.abs(Math.sin(s.tw));
+    ctx.fillStyle = "#cfe9ff";
+    ctx.fillRect(s.x, s.y, s.s, s.s);
+  }
+  ctx.globalAlpha = 1;
+  // nebula blobs
+  ctx.globalAlpha = 0.10; ctx.fillStyle = "#ff2d78";
+  ctx.beginPath(); ctx.arc(90, 300, 130, 0, TAU); ctx.fill();
+  ctx.fillStyle = "#00e5ff";
+  ctx.beginPath(); ctx.arc(470, 640, 150, 0, TAU); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  if (state !== "title") {
+    for (const s of stars) drawStar(s);
+    for (const a of asteroids) drawAsteroid(a);
+    for (const p of parts) {
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    if (state !== "over") drawShip();
+    drawHUD();
+  }
+  if (state === "title") {
+    drawCenter([
+      { text: "NEON", font: "800 84px 'Segoe UI', system-ui, sans-serif", y: 300, color: "#00e5ff" },
+      { text: "DODGER", font: "800 84px 'Segoe UI', system-ui, sans-serif", y: 388, color: "#ff2d78" },
+      { text: "one prompt · one game · zero libraries", font: "500 19px 'Segoe UI', system-ui, sans-serif", y: 470, color: "rgba(255,255,255,.8)" },
+      { text: "Dodge the asteroids. Grab the stars.", font: "600 22px 'Segoe UI', system-ui, sans-serif", y: 560 },
+      { text: "3 lives — speed rises every 10s", font: "500 20px 'Segoe UI', system-ui, sans-serif", y: 596, color: "rgba(255,255,255,.7)" },
+      { text: AUTOPLAY ? "▶ DEMO MODE — autopilot flying" : "▶ PRESS ANY KEY / TAP TO PLAY", font: "700 24px 'Segoe UI', system-ui, sans-serif", y: 700, color: "#ffe94d" },
+      { text: "Arrows / WASD / mouse / touch", font: "500 18px 'Segoe UI', system-ui, sans-serif", y: 744, color: "rgba(255,255,255,.6)" },
+    ], "#00e5ff");
+  }
+  if (state === "paused") {
+    ctx.fillStyle = "rgba(5,5,16,.72)"; ctx.fillRect(-20, -20, W + 40, H + 40);
+    drawCenter([{ text: "PAUSED", font: "800 64px 'Segoe UI', system-ui, sans-serif", y: 470, color: "#00e5ff" },
+                { text: "press P to resume", font: "500 22px 'Segoe UI', system-ui, sans-serif", y: 540 }], "#00e5ff");
+  }
+  if (state === "over") {
+    ctx.fillStyle = "rgba(5,5,16,.66)"; ctx.fillRect(-20, -20, W + 40, H + 40);
+    drawCenter([
+      { text: "GAME OVER", font: "800 62px 'Segoe UI', system-ui, sans-serif", y: 380, color: "#ff2d78" },
+      { text: "SCORE  " + Math.floor(score), font: "700 40px 'Segoe UI', system-ui, sans-serif", y: 470 },
+      { text: (Math.floor(score) >= best && score > 0 ? "★ NEW BEST! ★  " : "BEST  ") + best, font: "600 24px 'Segoe UI', system-ui, sans-serif", y: 530, color: "#ffe94d" },
+      { text: "press R or tap to fly again", font: "500 22px 'Segoe UI', system-ui, sans-serif", y: 620, color: "rgba(255,255,255,.8)" },
+    ], "#ff2d78");
+  }
+  if (flash > 0) { ctx.fillStyle = `rgba(255,45,120,${flash * 0.35})`; ctx.fillRect(-20, -20, W + 40, H + 40); }
+  ctx.restore();
+}
+
+// ---------- main loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (state === "playing") update(dt);
+  else if (state === "title" || state === "over") {
+    for (const s of bgStars) { s.y += s.v * dt; s.tw += dt * 3; if (s.y > H) { s.y = -4; s.x = rand(0, W); } }
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+if (AUTOPLAY) startGame();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
