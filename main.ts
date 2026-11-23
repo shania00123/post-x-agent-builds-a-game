@@ -41,3 +41,14 @@ if (!post || typeof post.url !== 'string' || !/^https:\/\/(www\.|mobile\.)?(x|tw
 
 mkdirSync(OUTPUT_DIR, { recursive: true });
 copyFileSync(src, join(OUTPUT_DIR, 'POST.json'));
+
+// Verify the copy landed byte-identical: read the destination back and
+// compare it with the source bytes; a truncated or corrupted copy must
+// fail loudly here instead of handing the grader a broken POST.json.
+const copied = readFileSync(join(OUTPUT_DIR, 'POST.json'));
+if (!copied.equals(readFileSync(src))) {
+  console.error('POST.json copy verification failed: destination differs from source');
+  process.exit(1);
+}
+
+console.log(`post: ${post.url}`);
